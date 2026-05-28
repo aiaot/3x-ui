@@ -1,22 +1,27 @@
+// Package controller provides HTTP request handlers and controllers for the 3x-ui web management panel.
+// It handles routing, authentication, and API endpoints for managing Xray inbounds, settings, and more.
 package controller
 
 import (
 	"net/http"
 
-	"x-ui/logger"
-	"x-ui/web/locale"
-	"x-ui/web/session"
+	"github.com/mhsanaei/3x-ui/v3/logger"
+	"github.com/mhsanaei/3x-ui/v3/web/locale"
+	"github.com/mhsanaei/3x-ui/v3/web/session"
 
 	"github.com/gin-gonic/gin"
 )
 
+// BaseController provides common functionality for all controllers, including authentication checks.
 type BaseController struct{}
 
+// checkLogin is a middleware that verifies user authentication and handles unauthorized access.
 func (a *BaseController) checkLogin(c *gin.Context) {
 	if !session.IsLogin(c) {
 		if isAjax(c) {
 			pureJsonMsg(c, http.StatusUnauthorized, false, I18nWeb(c, "pages.login.loginAgain"))
 		} else {
+			c.Header("Cache-Control", "no-store")
 			c.Redirect(http.StatusTemporaryRedirect, c.GetString("base_path"))
 		}
 		c.Abort()
@@ -25,6 +30,7 @@ func (a *BaseController) checkLogin(c *gin.Context) {
 	}
 }
 
+// I18nWeb retrieves an internationalized message for the web interface based on the current locale.
 func I18nWeb(c *gin.Context, name string, params ...string) string {
 	anyfunc, funcExists := c.Get("I18n")
 	if !funcExists {

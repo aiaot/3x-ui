@@ -2,15 +2,19 @@ package controller
 
 import (
 	"errors"
+	"strconv"
 	"time"
 
-	"x-ui/web/entity"
-	"x-ui/web/service"
-	"x-ui/web/session"
+	"github.com/mhsanaei/3x-ui/v3/util/crypto"
+	"github.com/mhsanaei/3x-ui/v3/web/entity"
+	"github.com/mhsanaei/3x-ui/v3/web/middleware"
+	"github.com/mhsanaei/3x-ui/v3/web/service"
+	"github.com/mhsanaei/3x-ui/v3/web/session"
 
 	"github.com/gin-gonic/gin"
 )
 
+// updateUserForm represents the form for updating user credentials.
 type updateUserForm struct {
 	OldUsername string `json:"oldUsername" form:"oldUsername"`
 	OldPassword string `json:"oldPassword" form:"oldPassword"`
@@ -18,22 +22,22 @@ type updateUserForm struct {
 	NewPassword string `json:"newPassword" form:"newPassword"`
 }
 
-type updateSecretForm struct {
-	LoginSecret string `json:"loginSecret" form:"loginSecret"`
-}
-
+// SettingController handles settings and user management operations.
 type SettingController struct {
-	settingService service.SettingService
-	userService    service.UserService
-	panelService   service.PanelService
+	settingService  service.SettingService
+	userService     service.UserService
+	panelService    service.PanelService
+	apiTokenService service.ApiTokenService
 }
 
+// NewSettingController creates a new SettingController and initializes its routes.
 func NewSettingController(g *gin.RouterGroup) *SettingController {
 	a := &SettingController{}
 	a.initRouter(g)
 	return a
 }
 
+// initRouter sets up the routes for settings management.
 func (a *SettingController) initRouter(g *gin.RouterGroup) {
 	g = g.Group("/setting")
 
@@ -43,10 +47,13 @@ func (a *SettingController) initRouter(g *gin.RouterGroup) {
 	g.POST("/updateUser", a.updateUser)
 	g.POST("/restartPanel", a.restartPanel)
 	g.GET("/getDefaultJsonConfig", a.getDefaultXrayConfig)
-	g.POST("/updateUserSecret", a.updateSecret)
-	g.POST("/getUserSecret", a.getUserSecret)
+	g.GET("/apiTokens", a.listApiTokens)
+	g.POST("/apiTokens/create", a.createApiToken)
+	g.POST("/apiTokens/delete/:id", a.deleteApiToken)
+	g.POST("/apiTokens/setEnabled/:id", a.setApiTokenEnabled)
 }
 
+// getAllSetting retrieves all current settings.
 func (a *SettingController) getAllSetting(c *gin.Context) {
 	allSetting, err := a.settingService.GetAllSetting()
 	if err != nil {
@@ -56,6 +63,7 @@ func (a *SettingController) getAllSetting(c *gin.Context) {
 	jsonObj(c, allSetting, nil)
 }
 
+// getDefaultSettings retrieves the default settings based on the host.
 func (a *SettingController) getDefaultSettings(c *gin.Context) {
 	result, err := a.settingService.GetDefaultSettings(c.Request.Host)
 	if err != nil {
@@ -65,17 +73,23 @@ func (a *SettingController) getDefaultSettings(c *gin.Context) {
 	jsonObj(c, result, nil)
 }
 
+// updateSetting updates all settings with the provided data.
 func (a *SettingController) updateSetting(c *gin.Context) {
-	allSetting := &entity.AllSetting{}
-	err := c.ShouldBind(allSetting)
-	if err != nil {
-		jsonMsg(c, I18nWeb(c, "pages.settings.toasts.modifySettings"), err)
+	allSetting, ok := middleware.BindAndValidate[entity.AllSetting](c)
+	if !ok {
 		return
 	}
-	err = a.settingService.UpdateAllSetting(allSetting)
+	oldTwoFactor, twoFactorErr := a.settingService.GetTwoFactorEnable()
+	err := a.settingService.UpdateAllSetting(allSetting)
+	if err == nil && twoFactorErr == nil && !oldTwoFactor && allSetting.TwoFactorEnable {
+		if bumpErr := a.userService.BumpLoginEpoch(); bumpErr != nil {
+			err = bumpErr
+		}
+	}
 	jsonMsg(c, I18nWeb(c, "pages.settings.toasts.modifySettings"), err)
 }
 
+// updateUser updates the current user's username and password.
 func (a *SettingController) updateUser(c *gin.Context) {
 	form := &updateUserForm{}
 	err := c.ShouldBind(form)
@@ -84,51 +98,32 @@ func (a *SettingController) updateUser(c *gin.Context) {
 		return
 	}
 	user := session.GetLoginUser(c)
-	if user.Username != form.OldUsername || user.Password != form.OldPassword {
-		jsonMsg(c, I18nWeb(c, "pages.settings.toasts.modifyUser"), errors.New(I18nWeb(c, "pages.settings.toasts.originalUserPassIncorrect")))
+	if user.Username != form.OldUsername || !crypto.CheckPasswordHash(user.Password, form.OldPassword) {
+		jsonMsg(c, I18nWeb(c, "pages.settings.toasts.modifyUserError"), errors.New(I18nWeb(c, "pages.settings.toasts.originalUserPassIncorrect")))
 		return
 	}
 	if form.NewUsername == "" || form.NewPassword == "" {
-		jsonMsg(c, I18nWeb(c, "pages.settings.toasts.modifyUser"), errors.New(I18nWeb(c, "pages.settings.toasts.userPassMustBeNotEmpty")))
+		jsonMsg(c, I18nWeb(c, "pages.settings.toasts.modifyUserError"), errors.New(I18nWeb(c, "pages.settings.toasts.userPassMustBeNotEmpty")))
 		return
 	}
 	err = a.userService.UpdateUser(user.Id, form.NewUsername, form.NewPassword)
 	if err == nil {
 		user.Username = form.NewUsername
-		user.Password = form.NewPassword
-		session.SetLoginUser(c, user)
+		user.Password, _ = crypto.HashPasswordAsBcrypt(form.NewPassword)
+		if saveErr := session.SetLoginUser(c, user); saveErr != nil {
+			err = saveErr
+		}
 	}
 	jsonMsg(c, I18nWeb(c, "pages.settings.toasts.modifyUser"), err)
 }
 
+// restartPanel restarts the panel service after a delay.
 func (a *SettingController) restartPanel(c *gin.Context) {
 	err := a.panelService.RestartPanel(time.Second * 3)
-	jsonMsg(c, I18nWeb(c, "pages.settings.restartPanel"), err)
+	jsonMsg(c, I18nWeb(c, "pages.settings.restartPanelSuccess"), err)
 }
 
-func (a *SettingController) updateSecret(c *gin.Context) {
-	form := &updateSecretForm{}
-	err := c.ShouldBind(form)
-	if err != nil {
-		jsonMsg(c, I18nWeb(c, "pages.settings.toasts.modifySettings"), err)
-	}
-	user := session.GetLoginUser(c)
-	err = a.userService.UpdateUserSecret(user.Id, form.LoginSecret)
-	if err == nil {
-		user.LoginSecret = form.LoginSecret
-		session.SetLoginUser(c, user)
-	}
-	jsonMsg(c, I18nWeb(c, "pages.settings.toasts.modifyUser"), err)
-}
-
-func (a *SettingController) getUserSecret(c *gin.Context) {
-	loginUser := session.GetLoginUser(c)
-	user := a.userService.GetUserSecret(loginUser.Id)
-	if user != nil {
-		jsonObj(c, user, nil)
-	}
-}
-
+// getDefaultXrayConfig retrieves the default Xray configuration.
 func (a *SettingController) getDefaultXrayConfig(c *gin.Context) {
 	defaultJsonConfig, err := a.settingService.GetDefaultXrayConfig()
 	if err != nil {
@@ -136,4 +131,58 @@ func (a *SettingController) getDefaultXrayConfig(c *gin.Context) {
 		return
 	}
 	jsonObj(c, defaultJsonConfig, nil)
+}
+
+type apiTokenCreateForm struct {
+	Name string `json:"name" form:"name"`
+}
+
+type apiTokenEnabledForm struct {
+	Enabled bool `json:"enabled" form:"enabled"`
+}
+
+func (a *SettingController) listApiTokens(c *gin.Context) {
+	rows, err := a.apiTokenService.List()
+	if err != nil {
+		jsonMsg(c, I18nWeb(c, "pages.settings.toasts.getSettings"), err)
+		return
+	}
+	jsonObj(c, rows, nil)
+}
+
+func (a *SettingController) createApiToken(c *gin.Context) {
+	form := &apiTokenCreateForm{}
+	if err := c.ShouldBind(form); err != nil {
+		jsonMsg(c, I18nWeb(c, "pages.settings.toasts.modifySettings"), err)
+		return
+	}
+	row, err := a.apiTokenService.Create(form.Name)
+	if err != nil {
+		jsonMsg(c, I18nWeb(c, "pages.settings.toasts.modifySettings"), err)
+		return
+	}
+	jsonObj(c, row, nil)
+}
+
+func (a *SettingController) deleteApiToken(c *gin.Context) {
+	id, err := strconv.Atoi(c.Param("id"))
+	if err != nil {
+		jsonMsg(c, I18nWeb(c, "pages.settings.toasts.modifySettings"), err)
+		return
+	}
+	jsonMsg(c, I18nWeb(c, "pages.settings.toasts.modifySettings"), a.apiTokenService.Delete(id))
+}
+
+func (a *SettingController) setApiTokenEnabled(c *gin.Context) {
+	id, err := strconv.Atoi(c.Param("id"))
+	if err != nil {
+		jsonMsg(c, I18nWeb(c, "pages.settings.toasts.modifySettings"), err)
+		return
+	}
+	form := &apiTokenEnabledForm{}
+	if bindErr := c.ShouldBind(form); bindErr != nil {
+		jsonMsg(c, I18nWeb(c, "pages.settings.toasts.modifySettings"), bindErr)
+		return
+	}
+	jsonMsg(c, I18nWeb(c, "pages.settings.toasts.modifySettings"), a.apiTokenService.SetEnabled(id, form.Enabled))
 }

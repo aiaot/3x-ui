@@ -4,80 +4,100 @@ import (
 	_ "embed"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"strings"
 
-	"x-ui/database/model"
-	"x-ui/logger"
-	"x-ui/util/json_util"
-	"x-ui/util/random"
-	"x-ui/web/service"
-	"x-ui/xray"
+	"github.com/mhsanaei/3x-ui/v3/database/model"
+	"github.com/mhsanaei/3x-ui/v3/logger"
+	"github.com/mhsanaei/3x-ui/v3/util/json_util"
+	"github.com/mhsanaei/3x-ui/v3/util/random"
+	"github.com/mhsanaei/3x-ui/v3/web/service"
 )
 
 //go:embed default.json
 var defaultJson string
 
+// SubJsonService handles JSON subscription configuration generation and management.
 type SubJsonService struct {
-	configJson       map[string]interface{}
+	configJson       map[string]any
 	defaultOutbounds []json_util.RawMessage
-	fragment         string
-	noises           string
+	fragmentOrNoises bool
 	mux              string
 
 	inboundService service.InboundService
 	SubService     *SubService
 }
 
+// NewSubJsonService creates a new JSON subscription service with the given configuration.
 func NewSubJsonService(fragment string, noises string, mux string, rules string, subService *SubService) *SubJsonService {
-	var configJson map[string]interface{}
+	var configJson map[string]any
 	var defaultOutbounds []json_util.RawMessage
 	json.Unmarshal([]byte(defaultJson), &configJson)
-	if outboundSlices, ok := configJson["outbounds"].([]interface{}); ok {
+	if outboundSlices, ok := configJson["outbounds"].([]any); ok {
 		for _, defaultOutbound := range outboundSlices {
 			jsonBytes, _ := json.Marshal(defaultOutbound)
 			defaultOutbounds = append(defaultOutbounds, jsonBytes)
 		}
 	}
 
+	fragmentOrNoises := false
+	if fragment != "" || noises != "" {
+		fragmentOrNoises = true
+		defaultOutboundsSettings := map[string]any{
+			"domainStrategy": "UseIP",
+			"redirect":       "",
+		}
+
+		if fragment != "" {
+			defaultOutboundsSettings["fragment"] = json_util.RawMessage(fragment)
+		}
+
+		if noises != "" {
+			defaultOutboundsSettings["noises"] = json_util.RawMessage(noises)
+		}
+
+		defaultDirectOutbound := map[string]any{
+			"protocol": "freedom",
+			"settings": defaultOutboundsSettings,
+			"tag":      "direct_out",
+		}
+		jsonBytes, _ := json.MarshalIndent(defaultDirectOutbound, "", "  ")
+		defaultOutbounds = append(defaultOutbounds, jsonBytes)
+	}
+
 	if rules != "" {
-		var newRules []interface{}
-		routing, _ := configJson["routing"].(map[string]interface{})
-		defaultRules, _ := routing["rules"].([]interface{})
+		var newRules []any
+		routing, _ := configJson["routing"].(map[string]any)
+		defaultRules, _ := routing["rules"].([]any)
 		json.Unmarshal([]byte(rules), &newRules)
 		defaultRules = append(newRules, defaultRules...)
 		routing["rules"] = defaultRules
 		configJson["routing"] = routing
 	}
 
-	if fragment != "" {
-		defaultOutbounds = append(defaultOutbounds, json_util.RawMessage(fragment))
-	}
-
-	if noises != "" {
-		defaultOutbounds = append(defaultOutbounds, json_util.RawMessage(noises))
-	}
-
 	return &SubJsonService{
 		configJson:       configJson,
 		defaultOutbounds: defaultOutbounds,
-		fragment:         fragment,
-		noises:           noises,
+		fragmentOrNoises: fragmentOrNoises,
 		mux:              mux,
 		SubService:       subService,
 	}
 }
 
+// GetJson generates a JSON subscription configuration for the given subscription ID and host.
 func (s *SubJsonService) GetJson(subId string, host string) (string, string, error) {
+	// Set per-request state on the shared SubService so any
+	// resolveInboundAddress call inside picks node-aware host values.
+	s.SubService.PrepareForRequest(host)
 	inbounds, err := s.SubService.getInboundsBySubId(subId)
 	if err != nil || len(inbounds) == 0 {
 		return "", "", err
 	}
 
 	var header string
-	var traffic xray.ClientTraffic
-	var clientTraffics []xray.ClientTraffic
 	var configArray []json_util.RawMessage
 
+	seenEmails := make(map[string]struct{})
 	// Prepare Inbounds
 	for _, inbound := range inbounds {
 		clients, err := s.inboundService.GetClients(inbound)
@@ -87,20 +107,12 @@ func (s *SubJsonService) GetJson(subId string, host string) (string, string, err
 		if clients == nil {
 			continue
 		}
-		if len(inbound.Listen) > 0 && inbound.Listen[0] == '@' {
-			listen, port, streamSettings, err := s.SubService.getFallbackMaster(inbound.Listen, inbound.StreamSettings)
-			if err == nil {
-				inbound.Listen = listen
-				inbound.Port = port
-				inbound.StreamSettings = streamSettings
-			}
-		}
+		s.SubService.projectThroughFallbackMaster(inbound)
 
 		for _, client := range clients {
-			if client.Enable && client.SubID == subId {
-				clientTraffics = append(clientTraffics, s.SubService.getClientTraffics(inbound.ClientStats, client.Email))
-				newConfigs := s.getConfig(inbound, client, host)
-				configArray = append(configArray, newConfigs...)
+			if client.SubID == subId {
+				seenEmails[client.Email] = struct{}{}
+				configArray = append(configArray, s.getConfig(inbound, client, host)...)
 			}
 		}
 	}
@@ -109,28 +121,11 @@ func (s *SubJsonService) GetJson(subId string, host string) (string, string, err
 		return "", "", nil
 	}
 
-	// Prepare statistics
-	for index, clientTraffic := range clientTraffics {
-		if index == 0 {
-			traffic.Up = clientTraffic.Up
-			traffic.Down = clientTraffic.Down
-			traffic.Total = clientTraffic.Total
-			if clientTraffic.ExpiryTime > 0 {
-				traffic.ExpiryTime = clientTraffic.ExpiryTime
-			}
-		} else {
-			traffic.Up += clientTraffic.Up
-			traffic.Down += clientTraffic.Down
-			if traffic.Total == 0 || clientTraffic.Total == 0 {
-				traffic.Total = 0
-			} else {
-				traffic.Total += clientTraffic.Total
-			}
-			if clientTraffic.ExpiryTime != traffic.ExpiryTime {
-				traffic.ExpiryTime = 0
-			}
-		}
+	emails := make([]string, 0, len(seenEmails))
+	for e := range seenEmails {
+		emails = append(emails, e)
 	}
+	traffic, _ := s.SubService.AggregateTrafficByEmails(emails)
 
 	// Combile outbounds
 	var finalJson []byte
@@ -148,12 +143,23 @@ func (s *SubJsonService) getConfig(inbound *model.Inbound, client model.Client, 
 	var newJsonArray []json_util.RawMessage
 	stream := s.streamData(inbound.StreamSettings)
 
-	externalProxies, ok := stream["externalProxy"].([]interface{})
-	if !ok || len(externalProxies) == 0 {
-		externalProxies = []interface{}{
-			map[string]interface{}{
+	// When externalProxy is empty the JSON config falls back to a
+	// synthetic one whose `dest` is the host the client connects to.
+	// For node-managed inbounds we want the node's address — request
+	// host won't reach the right xray. resolveInboundAddress already
+	// implements the node→listen→request-host fallback chain.
+	defaultDest := s.SubService.resolveInboundAddress(inbound)
+	if defaultDest == "" {
+		defaultDest = host
+	}
+
+	externalProxies, ok := stream["externalProxy"].([]any)
+	hasExternalProxy := ok && len(externalProxies) > 0
+	if !hasExternalProxy {
+		externalProxies = []any{
+			map[string]any{
 				"forceTls": "same",
-				"dest":     host,
+				"dest":     defaultDest,
 				"port":     float64(inbound.Port),
 				"remark":   "",
 			},
@@ -163,38 +169,45 @@ func (s *SubJsonService) getConfig(inbound *model.Inbound, client model.Client, 
 	delete(stream, "externalProxy")
 
 	for _, ep := range externalProxies {
-		extPrxy := ep.(map[string]interface{})
+		extPrxy := ep.(map[string]any)
 		inbound.Listen = extPrxy["dest"].(string)
 		inbound.Port = int(extPrxy["port"].(float64))
-		newStream := stream
+		newStream := cloneStreamForExternalProxy(stream)
 		switch extPrxy["forceTls"].(string) {
 		case "tls":
 			if newStream["security"] != "tls" {
 				newStream["security"] = "tls"
-				newStream["tslSettings"] = map[string]interface{}{}
+				newStream["tlsSettings"] = map[string]any{}
 			}
 		case "none":
 			if newStream["security"] != "none" {
 				newStream["security"] = "none"
-				delete(newStream, "tslSettings")
+				delete(newStream, "tlsSettings")
 			}
+		}
+		security, _ := newStream["security"].(string)
+		if hasExternalProxy {
+			applyExternalProxyTLSToStream(extPrxy, newStream, security)
 		}
 		streamSettings, _ := json.MarshalIndent(newStream, "", "  ")
 
 		var newOutbounds []json_util.RawMessage
 
 		switch inbound.Protocol {
-		case "vmess", "vless":
+		case "vmess":
 			newOutbounds = append(newOutbounds, s.genVnext(inbound, streamSettings, client))
+		case "vless":
+			newOutbounds = append(newOutbounds, s.genVless(inbound, streamSettings, client))
 		case "trojan", "shadowsocks":
 			newOutbounds = append(newOutbounds, s.genServer(inbound, streamSettings, client))
+		case "hysteria":
+			newOutbounds = append(newOutbounds, s.genHy(inbound, newStream, client))
 		}
 
 		newOutbounds = append(newOutbounds, s.defaultOutbounds...)
-		newConfigJson := make(map[string]interface{})
-		for key, value := range s.configJson {
-			newConfigJson[key] = value
-		}
+		newConfigJson := make(map[string]any)
+		maps.Copy(newConfigJson, s.configJson)
+
 		newConfigJson["outbounds"] = newOutbounds
 		newConfigJson["remarks"] = s.SubService.genRemark(inbound, client.Email, extPrxy["remark"].(string))
 
@@ -205,19 +218,20 @@ func (s *SubJsonService) getConfig(inbound *model.Inbound, client model.Client, 
 	return newJsonArray
 }
 
-func (s *SubJsonService) streamData(stream string) map[string]interface{} {
-	var streamSettings map[string]interface{}
+func (s *SubJsonService) streamData(stream string) map[string]any {
+	var streamSettings map[string]any
 	json.Unmarshal([]byte(stream), &streamSettings)
 	security, _ := streamSettings["security"].(string)
-	if security == "tls" {
-		streamSettings["tlsSettings"] = s.tlsData(streamSettings["tlsSettings"].(map[string]interface{}))
-	} else if security == "reality" {
-		streamSettings["realitySettings"] = s.realityData(streamSettings["realitySettings"].(map[string]interface{}))
+	switch security {
+	case "tls":
+		streamSettings["tlsSettings"] = s.tlsData(streamSettings["tlsSettings"].(map[string]any))
+	case "reality":
+		streamSettings["realitySettings"] = s.realityData(streamSettings["realitySettings"].(map[string]any))
 	}
 	delete(streamSettings, "sockopt")
 
-	if s.fragment != "" {
-		streamSettings["sockopt"] = json_util.RawMessage(`{"dialerProxy": "fragment", "tcpKeepAliveIdle": 100, "tcpMptcp": true, "penetrate": true}`)
+	if s.fragmentOrNoises {
+		streamSettings["sockopt"] = json_util.RawMessage(`{"dialerProxy": "direct_out", "tcpKeepAliveIdle": 100}`)
 	}
 
 	// remove proxy protocol
@@ -229,50 +243,56 @@ func (s *SubJsonService) streamData(stream string) map[string]interface{} {
 		streamSettings["wsSettings"] = s.removeAcceptProxy(streamSettings["wsSettings"])
 	case "httpupgrade":
 		streamSettings["httpupgradeSettings"] = s.removeAcceptProxy(streamSettings["httpupgradeSettings"])
+	case "xhttp":
+		streamSettings["xhttpSettings"] = s.removeAcceptProxy(streamSettings["xhttpSettings"])
+		if xhttp, ok := streamSettings["xhttpSettings"].(map[string]any); ok {
+			delete(xhttp, "noSSEHeader")
+			delete(xhttp, "scMaxBufferedPosts")
+			delete(xhttp, "scStreamUpServerSecs")
+			delete(xhttp, "serverMaxHeaderBytes")
+		}
 	}
 	return streamSettings
 }
 
-func (s *SubJsonService) removeAcceptProxy(setting interface{}) map[string]interface{} {
-	netSettings, ok := setting.(map[string]interface{})
+func (s *SubJsonService) removeAcceptProxy(setting any) map[string]any {
+	netSettings, ok := setting.(map[string]any)
 	if ok {
 		delete(netSettings, "acceptProxyProtocol")
 	}
 	return netSettings
 }
 
-func (s *SubJsonService) tlsData(tData map[string]interface{}) map[string]interface{} {
-	tlsData := make(map[string]interface{}, 1)
-	tlsClientSettings, _ := tData["settings"].(map[string]interface{})
+func (s *SubJsonService) tlsData(tData map[string]any) map[string]any {
+	tlsData := make(map[string]any, 1)
+	tlsClientSettings, _ := tData["settings"].(map[string]any)
 
 	tlsData["serverName"] = tData["serverName"]
 	tlsData["alpn"] = tData["alpn"]
-	if allowInsecure, ok := tlsClientSettings["allowInsecure"].(bool); ok {
-		tlsData["allowInsecure"] = allowInsecure
-	}
 	if fingerprint, ok := tlsClientSettings["fingerprint"].(string); ok {
 		tlsData["fingerprint"] = fingerprint
 	}
 	return tlsData
 }
 
-func (s *SubJsonService) realityData(rData map[string]interface{}) map[string]interface{} {
-	rltyData := make(map[string]interface{}, 1)
-	rltyClientSettings, _ := rData["settings"].(map[string]interface{})
+func (s *SubJsonService) realityData(rData map[string]any) map[string]any {
+	rltyData := make(map[string]any, 1)
+	rltyClientSettings, _ := rData["settings"].(map[string]any)
 
 	rltyData["show"] = false
 	rltyData["publicKey"] = rltyClientSettings["publicKey"]
 	rltyData["fingerprint"] = rltyClientSettings["fingerprint"]
+	rltyData["mldsa65Verify"] = rltyClientSettings["mldsa65Verify"]
 
 	// Set random data
 	rltyData["spiderX"] = "/" + random.Seq(15)
-	shortIds, ok := rData["shortIds"].([]interface{})
+	shortIds, ok := rData["shortIds"].([]any)
 	if ok && len(shortIds) > 0 {
 		rltyData["shortId"] = shortIds[random.Num(len(shortIds))].(string)
 	} else {
 		rltyData["shortId"] = ""
 	}
-	serverNames, ok := rData["serverNames"].([]interface{})
+	serverNames, ok := rData["serverNames"].([]any)
 	if ok && len(serverNames) > 0 {
 		rltyData["serverName"] = serverNames[random.Num(len(serverNames))].(string)
 	} else {
@@ -287,15 +307,8 @@ func (s *SubJsonService) genVnext(inbound *model.Inbound, streamSettings json_ut
 	usersData := make([]UserVnext, 1)
 
 	usersData[0].ID = client.ID
-	usersData[0].Level = 8
-	if inbound.Protocol == model.VMESS {
-		usersData[0].Security = client.Security
-	}
-	if inbound.Protocol == model.VLESS {
-		usersData[0].Flow = client.Flow
-		usersData[0].Encryption = "none"
-	}
-
+	usersData[0].Email = client.Email
+	usersData[0].Security = client.Security
 	vnextData := make([]VnextSetting, 1)
 	vnextData[0] = VnextSetting{
 		Address: inbound.Listen,
@@ -309,10 +322,46 @@ func (s *SubJsonService) genVnext(inbound *model.Inbound, streamSettings json_ut
 		outbound.Mux = json_util.RawMessage(s.mux)
 	}
 	outbound.StreamSettings = streamSettings
-	outbound.Settings = OutboundSettings{
-		Vnext: vnextData,
+	outbound.Settings = map[string]any{
+		"vnext": vnextData,
 	}
 
+	result, _ := json.MarshalIndent(outbound, "", "  ")
+	return result
+}
+
+func (s *SubJsonService) genVless(inbound *model.Inbound, streamSettings json_util.RawMessage, client model.Client) json_util.RawMessage {
+	outbound := Outbound{}
+	outbound.Protocol = string(inbound.Protocol)
+	outbound.Tag = "proxy"
+	if s.mux != "" {
+		outbound.Mux = json_util.RawMessage(s.mux)
+	}
+	outbound.StreamSettings = streamSettings
+
+	// Add encryption for VLESS outbound from inbound settings
+	var inboundSettings map[string]any
+	json.Unmarshal([]byte(inbound.Settings), &inboundSettings)
+	encryption, _ := inboundSettings["encryption"].(string)
+
+	user := map[string]any{
+		"id":         client.ID,
+		"level":      8,
+		"encryption": encryption,
+	}
+	if client.Flow != "" {
+		user["flow"] = client.Flow
+	}
+
+	vnext := map[string]any{
+		"address": inbound.Listen,
+		"port":    inbound.Port,
+		"users":   []any{user},
+	}
+
+	outbound.Settings = map[string]any{
+		"vnext": []any{vnext},
+	}
 	result, _ := json.MarshalIndent(outbound, "", "  ")
 	return result
 }
@@ -329,7 +378,7 @@ func (s *SubJsonService) genServer(inbound *model.Inbound, streamSettings json_u
 	}
 
 	if inbound.Protocol == model.Shadowsocks {
-		var inboundSettings map[string]interface{}
+		var inboundSettings map[string]any
 		json.Unmarshal([]byte(inbound.Settings), &inboundSettings)
 		method, _ := inboundSettings["method"].(string)
 		serverData[0].Method = method
@@ -348,26 +397,66 @@ func (s *SubJsonService) genServer(inbound *model.Inbound, streamSettings json_u
 		outbound.Mux = json_util.RawMessage(s.mux)
 	}
 	outbound.StreamSettings = streamSettings
-	outbound.Settings = OutboundSettings{
-		Servers: serverData,
+	outbound.Settings = map[string]any{
+		"servers": serverData,
 	}
 
 	result, _ := json.MarshalIndent(outbound, "", "  ")
 	return result
 }
 
-type Outbound struct {
-	Protocol       string                 `json:"protocol"`
-	Tag            string                 `json:"tag"`
-	StreamSettings json_util.RawMessage   `json:"streamSettings"`
-	Mux            json_util.RawMessage   `json:"mux,omitempty"`
-	ProxySettings  map[string]interface{} `json:"proxySettings,omitempty"`
-	Settings       OutboundSettings       `json:"settings,omitempty"`
+func (s *SubJsonService) genHy(inbound *model.Inbound, newStream map[string]any, client model.Client) json_util.RawMessage {
+	outbound := Outbound{}
+
+	outbound.Protocol = string(inbound.Protocol)
+	outbound.Tag = "proxy"
+
+	if s.mux != "" {
+		outbound.Mux = json_util.RawMessage(s.mux)
+	}
+
+	var settings, stream map[string]any
+	json.Unmarshal([]byte(inbound.Settings), &settings)
+	version, _ := settings["version"].(float64)
+	outbound.Settings = map[string]any{
+		"version": int(version),
+		"address": inbound.Listen,
+		"port":    inbound.Port,
+	}
+
+	json.Unmarshal([]byte(inbound.StreamSettings), &stream)
+	hyStream := stream["hysteriaSettings"].(map[string]any)
+	outHyStream := map[string]any{
+		"version": int(version),
+		"auth":    client.Auth,
+	}
+	if udpIdleTimeout, ok := hyStream["udpIdleTimeout"].(float64); ok {
+		outHyStream["udpIdleTimeout"] = int(udpIdleTimeout)
+	}
+	if masquerade, ok := hyStream["masquerade"].(map[string]any); ok {
+		outHyStream["masquerade"] = masquerade
+	}
+	newStream["hysteriaSettings"] = outHyStream
+
+	if finalmask, ok := hyStream["finalmask"].(map[string]any); ok {
+		newStream["finalmask"] = finalmask
+	}
+
+	newStream["network"] = "hysteria"
+	newStream["security"] = "tls"
+
+	outbound.StreamSettings, _ = json.MarshalIndent(newStream, "", "  ")
+
+	result, _ := json.MarshalIndent(outbound, "", "  ")
+	return result
 }
 
-type OutboundSettings struct {
-	Vnext   []VnextSetting  `json:"vnext,omitempty"`
-	Servers []ServerSetting `json:"servers,omitempty"`
+type Outbound struct {
+	Protocol       string               `json:"protocol"`
+	Tag            string               `json:"tag"`
+	StreamSettings json_util.RawMessage `json:"streamSettings"`
+	Mux            json_util.RawMessage `json:"mux,omitempty"`
+	Settings       map[string]any       `json:"settings,omitempty"`
 }
 
 type VnextSetting struct {
@@ -377,11 +466,9 @@ type VnextSetting struct {
 }
 
 type UserVnext struct {
-	Encryption string `json:"encryption,omitempty"`
-	Flow       string `json:"flow,omitempty"`
-	ID         string `json:"id"`
-	Security   string `json:"security,omitempty"`
-	Level      int    `json:"level"`
+	ID       string `json:"id"`
+	Email    string `json:"email,omitempty"`
+	Security string `json:"security,omitempty"`
 }
 
 type ServerSetting struct {

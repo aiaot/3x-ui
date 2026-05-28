@@ -1,52 +1,84 @@
 package controller
 
 import (
-    "errors"
 	"encoding/json"
-	"fmt"
+	"net"
 	"strconv"
-	"x-ui/database/model"
-	"x-ui/web/service"
-	"x-ui/web/session"
+	"strings"
+
+	"github.com/mhsanaei/3x-ui/v3/database/model"
+	"github.com/mhsanaei/3x-ui/v3/web/middleware"
+	"github.com/mhsanaei/3x-ui/v3/web/service"
+	"github.com/mhsanaei/3x-ui/v3/web/session"
+	"github.com/mhsanaei/3x-ui/v3/web/websocket"
 
 	"github.com/gin-gonic/gin"
 )
 
+// InboundController handles HTTP requests related to Xray inbounds management.
 type InboundController struct {
-	inboundService service.InboundService
-	xrayService    service.XrayService
+	inboundService  service.InboundService
+	clientService   service.ClientService
+	xrayService     service.XrayService
+	fallbackService service.FallbackService
 }
 
+// NewInboundController creates a new InboundController and sets up its routes.
 func NewInboundController(g *gin.RouterGroup) *InboundController {
 	a := &InboundController{}
 	a.initRouter(g)
 	return a
 }
 
-func (a *InboundController) initRouter(g *gin.RouterGroup) {
-	g = g.Group("/inbound")
+// broadcastInboundsUpdateClientLimit is the threshold past which we skip the
+// full-list push over WebSocket and signal the frontend to re-fetch via REST.
+// Mirrors the same heuristic used by the periodic traffic job.
+const broadcastInboundsUpdateClientLimit = 5000
 
-	g.POST("/list", a.getInbounds)
+// broadcastInboundsUpdate fetches and broadcasts the inbound list for userId.
+// At scale (10k+ clients) the marshaled JSON exceeds the WS payload ceiling,
+// so we send an invalidate signal instead — frontend re-fetches via REST.
+// Skipped entirely when no WebSocket clients are connected.
+func (a *InboundController) broadcastInboundsUpdate(userId int) {
+	if !websocket.HasClients() {
+		return
+	}
+	inbounds, err := a.inboundService.GetInbounds(userId)
+	if err != nil {
+		return
+	}
+	totalClients := 0
+	for _, ib := range inbounds {
+		totalClients += len(ib.ClientStats)
+	}
+	if totalClients > broadcastInboundsUpdateClientLimit {
+		websocket.BroadcastInvalidate(websocket.MessageTypeInbounds)
+		return
+	}
+	websocket.BroadcastInbounds(inbounds)
+}
+
+// initRouter initializes the routes for inbound-related operations.
+func (a *InboundController) initRouter(g *gin.RouterGroup) {
+
+	g.GET("/list", a.getInbounds)
+	g.GET("/list/slim", a.getInboundsSlim)
+	g.GET("/options", a.getInboundOptions)
+	g.GET("/get/:id", a.getInbound)
+	g.GET("/:id/fallbacks", a.getFallbacks)
+
 	g.POST("/add", a.addInbound)
 	g.POST("/del/:id", a.delInbound)
 	g.POST("/update/:id", a.updateInbound)
-	g.POST("/clientIps/:email", a.getClientIps)
-	g.POST("/clearClientIps/:email", a.clearClientIps)
-	g.POST("/addClient", a.addInboundClient)
-	g.POST("/addGroupClient", a.addGroupInboundClient)
-	g.POST("/:id/delClient/:clientId", a.delInboundClient)
-	g.POST("/delGroupClients", a.delGroupClients)
-	g.POST("/updateClient/:clientId", a.updateInboundClient)
-	g.POST("/updateClients", a.updateGroupInboundClient)
-	g.POST("/:id/resetClientTraffic/:email", a.resetClientTraffic)
-	g.POST("/resetGroupClientTraffic", a.resetGroupClientTraffic)
+	g.POST("/setEnable/:id", a.setInboundEnable)
+	g.POST("/:id/resetTraffic", a.resetInboundTraffic)
+	g.POST("/:id/delAllClients", a.delAllInboundClients)
 	g.POST("/resetAllTraffics", a.resetAllTraffics)
-	g.POST("/resetAllClientTraffics/:id", a.resetAllClientTraffics)
-	g.POST("/delDepletedClients/:id", a.delDepletedClients)
 	g.POST("/import", a.importInbound)
-	g.POST("/onlines", a.onlines)
+	g.POST("/:id/fallbacks", a.setFallbacks)
 }
 
+// getInbounds retrieves the list of inbounds for the logged-in user.
 func (a *InboundController) getInbounds(c *gin.Context) {
 	user := session.GetLoginUser(c)
 	inbounds, err := a.inboundService.GetInbounds(user.Id)
@@ -57,6 +89,32 @@ func (a *InboundController) getInbounds(c *gin.Context) {
 	jsonObj(c, inbounds, nil)
 }
 
+// getInboundsSlim is the list-page variant that strips full client
+// payloads from settings.clients[]. Detail-view flows still use /get/:id.
+func (a *InboundController) getInboundsSlim(c *gin.Context) {
+	user := session.GetLoginUser(c)
+	inbounds, err := a.inboundService.GetInboundsSlim(user.Id)
+	if err != nil {
+		jsonMsg(c, I18nWeb(c, "pages.inbounds.toasts.obtain"), err)
+		return
+	}
+	jsonObj(c, inbounds, nil)
+}
+
+// getInboundOptions returns a lightweight projection of the user's inbounds
+// (id, remark, protocol, port, tlsFlowCapable) for pickers in the clients UI.
+// Avoids shipping per-client settings and traffic stats just to fill a dropdown.
+func (a *InboundController) getInboundOptions(c *gin.Context) {
+	user := session.GetLoginUser(c)
+	options, err := a.inboundService.GetInboundOptions(user.Id)
+	if err != nil {
+		jsonMsg(c, I18nWeb(c, "pages.inbounds.toasts.obtain"), err)
+		return
+	}
+	jsonObj(c, options, nil)
+}
+
+// getInbound retrieves a specific inbound by its ID.
 func (a *InboundController) getInbound(c *gin.Context) {
 	id, err := strconv.Atoi(c.Param("id"))
 	if err != nil {
@@ -71,382 +129,202 @@ func (a *InboundController) getInbound(c *gin.Context) {
 	jsonObj(c, inbound, nil)
 }
 
-func (a *InboundController) getClientTraffics(c *gin.Context) {
-	email := c.Param("email")
-	clientTraffics, err := a.inboundService.GetClientTrafficByEmail(email)
-	if err != nil {
-		jsonMsg(c, "Error getting traffics", err)
-		return
-	}
-	jsonObj(c, clientTraffics, nil)
-}
-
-func (a *InboundController) getClientTrafficsById(c *gin.Context) {
-	id := c.Param("id")
-	clientTraffics, err := a.inboundService.GetClientTrafficByID(id)
-	if err != nil {
-		jsonMsg(c, "Error getting traffics", err)
-		return
-	}
-	jsonObj(c, clientTraffics, nil)
-}
-
+// addInbound creates a new inbound configuration.
 func (a *InboundController) addInbound(c *gin.Context) {
-	inbound := &model.Inbound{}
-	err := c.ShouldBind(inbound)
-	if err != nil {
-		jsonMsg(c, I18nWeb(c, "pages.inbounds.create"), err)
+	inbound, ok := middleware.BindAndValidate[model.Inbound](c)
+	if !ok {
 		return
 	}
 	user := session.GetLoginUser(c)
 	inbound.UserId = user.Id
-	if inbound.Listen == "" || inbound.Listen == "0.0.0.0" || inbound.Listen == "::" || inbound.Listen == "::0" {
-		inbound.Tag = fmt.Sprintf("inbound-%v", inbound.Port)
-	} else {
-		inbound.Tag = fmt.Sprintf("inbound-%v:%v", inbound.Listen, inbound.Port)
+	// Treat NodeID=0 as "no node" — gin's *int form binding can land on
+	// 0 when the field is absent or empty, and 0 is never a valid Node
+	// row id. Without this normalization the runtime layer would try to
+	// load Node id=0 and surface "record not found".
+	if inbound.NodeID != nil && *inbound.NodeID == 0 {
+		inbound.NodeID = nil
 	}
 
-	needRestart := false
-	inbound, needRestart, err = a.inboundService.AddInbound(inbound)
-	jsonMsgObj(c, I18nWeb(c, "pages.inbounds.create"), inbound, err)
-	if err == nil && needRestart {
+	inbound, needRestart, err := a.inboundService.AddInbound(inbound)
+	if err != nil {
+		jsonMsg(c, I18nWeb(c, "somethingWentWrong"), err)
+		return
+	}
+	jsonMsgObj(c, I18nWeb(c, "pages.inbounds.toasts.inboundCreateSuccess"), inbound, nil)
+	if needRestart {
 		a.xrayService.SetToNeedRestart()
 	}
+	a.broadcastInboundsUpdate(user.Id)
+	notifyClientsChanged()
 }
 
+// delInbound deletes an inbound configuration by its ID.
 func (a *InboundController) delInbound(c *gin.Context) {
 	id, err := strconv.Atoi(c.Param("id"))
 	if err != nil {
-		jsonMsg(c, I18nWeb(c, "delete"), err)
+		jsonMsg(c, I18nWeb(c, "pages.inbounds.toasts.inboundDeleteSuccess"), err)
 		return
 	}
-	needRestart := true
-	needRestart, err = a.inboundService.DelInbound(id)
-	jsonMsgObj(c, I18nWeb(c, "delete"), id, err)
-	if err == nil && needRestart {
+	needRestart, err := a.inboundService.DelInbound(id)
+	if err != nil {
+		jsonMsg(c, I18nWeb(c, "somethingWentWrong"), err)
+		return
+	}
+	jsonMsgObj(c, I18nWeb(c, "pages.inbounds.toasts.inboundDeleteSuccess"), id, nil)
+	if needRestart {
 		a.xrayService.SetToNeedRestart()
 	}
+	user := session.GetLoginUser(c)
+	a.broadcastInboundsUpdate(user.Id)
+	notifyClientsChanged()
 }
 
+// updateInbound updates an existing inbound configuration.
 func (a *InboundController) updateInbound(c *gin.Context) {
 	id, err := strconv.Atoi(c.Param("id"))
 	if err != nil {
-		jsonMsg(c, I18nWeb(c, "pages.inbounds.update"), err)
+		jsonMsg(c, I18nWeb(c, "pages.inbounds.toasts.inboundUpdateSuccess"), err)
 		return
 	}
 	inbound := &model.Inbound{
 		Id: id,
 	}
-	err = c.ShouldBind(inbound)
+	if !middleware.BindAndValidateInto(c, inbound) {
+		return
+	}
+	// Same NodeID=0 → nil normalisation as addInbound. UpdateInbound
+	// loads the existing row's NodeID from DB anyway (Phase 1 doesn't
+	// support migrating an inbound between nodes), but normalising here
+	// keeps the wire shape consistent.
+	if inbound.NodeID != nil && *inbound.NodeID == 0 {
+		inbound.NodeID = nil
+	}
+	inbound, needRestart, err := a.inboundService.UpdateInbound(inbound)
 	if err != nil {
-		jsonMsg(c, I18nWeb(c, "pages.inbounds.update"), err)
+		jsonMsg(c, I18nWeb(c, "somethingWentWrong"), err)
 		return
 	}
-	needRestart := true
-	inbound, needRestart, err = a.inboundService.UpdateInbound(inbound)
-	jsonMsgObj(c, I18nWeb(c, "pages.inbounds.update"), inbound, err)
-	if err == nil && needRestart {
-		a.xrayService.SetToNeedRestart()
-	}
-}
-
-func (a *InboundController) getClientIps(c *gin.Context) {
-	email := c.Param("email")
-
-	ips, err := a.inboundService.GetInboundClientIps(email)
-	if err != nil || ips == "" {
-		jsonObj(c, "No IP Record", nil)
-		return
-	}
-
-	jsonObj(c, ips, nil)
-}
-
-func (a *InboundController) clearClientIps(c *gin.Context) {
-	email := c.Param("email")
-
-	err := a.inboundService.ClearClientIps(email)
-	if err != nil {
-		jsonMsg(c, "Update", err)
-		return
-	}
-	jsonMsg(c, "Log Cleared", nil)
-}
-
-func (a *InboundController) addInboundClient(c *gin.Context) {
-	data := &model.Inbound{}
-	err := c.ShouldBind(data)
-	if err != nil {
-		jsonMsg(c, I18nWeb(c, "pages.inbounds.update"), err)
-		return
-	}
-
-	needRestart := true
-
-	needRestart, err = a.inboundService.AddInboundClient(data)
-	if err != nil {
-		jsonMsg(c, "Something went wrong!", err)
-		return
-	}
-	jsonMsg(c, "Client(s) added", nil)
+	jsonMsgObj(c, I18nWeb(c, "pages.inbounds.toasts.inboundUpdateSuccess"), inbound, nil)
 	if needRestart {
 		a.xrayService.SetToNeedRestart()
 	}
+	user := session.GetLoginUser(c)
+	a.broadcastInboundsUpdate(user.Id)
+	notifyClientsChanged()
 }
 
-func (a *InboundController) addGroupInboundClient(c *gin.Context) {
-	var requestData []model.Inbound
-
-    err := c.ShouldBindJSON(&requestData)
-
-    if err != nil {
-        jsonMsg(c, I18nWeb(c, "pages.inbounds.update"), err)
-        return
-    }
-
-    needRestart := true
-
-    for _, data := range requestData {
-
-        needRestart, err = a.inboundService.AddInboundClient(&data)
-        if err != nil {
-            jsonMsg(c, "Something went wrong!", err)
-            return
-        }
-    }
-
-    jsonMsg(c, "Client(s) added", nil)
-    if err == nil && needRestart {
-        a.xrayService.SetToNeedRestart()
-    }
-
-}
-
-func (a *InboundController) delInboundClient(c *gin.Context) {
+// setInboundEnable flips only the enable flag of an inbound. This is a
+// dedicated endpoint because the regular update path serialises the entire
+// settings JSON (every client) — far too heavy for an interactive switch
+// on inbounds with thousands of clients. Frontend optimistically updates
+// the UI; we just persist + sync xray + nudge other open admin sessions.
+func (a *InboundController) setInboundEnable(c *gin.Context) {
 	id, err := strconv.Atoi(c.Param("id"))
 	if err != nil {
-		jsonMsg(c, I18nWeb(c, "pages.inbounds.update"), err)
+		jsonMsg(c, I18nWeb(c, "pages.inbounds.toasts.inboundUpdateSuccess"), err)
 		return
 	}
-	clientId := c.Param("clientId")
-
-	needRestart := true
-
-	needRestart, err = a.inboundService.DelInboundClient(id, clientId)
+	type form struct {
+		Enable bool `json:"enable" form:"enable"`
+	}
+	var f form
+	if err := c.ShouldBind(&f); err != nil {
+		jsonMsg(c, I18nWeb(c, "somethingWentWrong"), err)
+		return
+	}
+	needRestart, err := a.inboundService.SetInboundEnable(id, f.Enable)
 	if err != nil {
-		jsonMsg(c, "Something went wrong!", err)
+		jsonMsg(c, I18nWeb(c, "somethingWentWrong"), err)
 		return
 	}
-	jsonMsg(c, "Client deleted", nil)
+	jsonMsg(c, I18nWeb(c, "pages.inbounds.toasts.inboundUpdateSuccess"), nil)
 	if needRestart {
 		a.xrayService.SetToNeedRestart()
 	}
+	// Cross-admin sync: lightweight invalidate signal (a few hundred bytes)
+	// instead of fetching + serialising the whole inbound list. Other open
+	// sessions re-fetch via REST. The toggling admin's own UI already
+	// updated optimistically.
+	websocket.BroadcastInvalidate(websocket.MessageTypeInbounds)
 }
 
-func (a *InboundController) delGroupClients(c *gin.Context) {
-	var requestData []struct {
-        InboundID int `json:"inboundId"`
-        ClientID  string `json:"clientId"`
-    }
-
-    if err := c.ShouldBindJSON(&requestData); err != nil {
-        jsonMsg(c, "Invalid request data", err)
-        return
-    }
-
-    needRestart := false
-
-    for _, req := range requestData {
-        needRestartTmp, err := a.inboundService.DelInboundClient(req.InboundID, req.ClientID)
-        if err != nil {
-            jsonMsg(c, "Failed to delete client", err)
-            return
-        }
-
-        if needRestartTmp {
-            needRestart = true
-        }
-    }
-
-    jsonMsg(c, "Clients deleted successfully", nil)
-
-    if needRestart {
-		a.xrayService.SetToNeedRestart()
-    }
-}
-
-func (a *InboundController) updateInboundClient(c *gin.Context) {
-	clientId := c.Param("clientId")
-
-	inbound := &model.Inbound{}
-	err := c.ShouldBind(inbound)
-	if err != nil {
-		jsonMsg(c, I18nWeb(c, "pages.inbounds.update"), err)
-		return
-	}
-
-	needRestart := true
-
-	needRestart, err = a.inboundService.UpdateInboundClient(inbound, clientId)
-	if err != nil {
-		jsonMsg(c, "Something went wrong!", err)
-		return
-	}
-	jsonMsg(c, "Client updated", nil)
-	if needRestart {
-		a.xrayService.SetToNeedRestart()
-	}
-}
-
-func (a *InboundController) updateGroupInboundClient(c *gin.Context) {
-    var requestData []map[string]interface{}
-
-    if err := c.ShouldBindJSON(&requestData); err != nil {
-        jsonMsg(c, I18nWeb(c, "pages.inbounds.update"), err)
-        return
-    }
-
-    needRestart := false
-
-    for _, item := range requestData {
-
-        inboundMap, ok := item["inbound"].(map[string]interface{})
-        if !ok {
-            jsonMsg(c, "Something went wrong!", errors.New("Failed to convert 'inbound' to map"))
-            return
-        }
-
-        clientId, ok := item["clientId"].(string)
-        if !ok {
-            jsonMsg(c, "Something went wrong!", errors.New("Failed to convert 'clientId' to string"))
-            return
-        }
-
-        inboundJSON, err := json.Marshal(inboundMap)
-        if err != nil {
-            jsonMsg(c, "Something went wrong!", err)
-            return
-        }
-
-        var inboundModel model.Inbound
-        if err := json.Unmarshal(inboundJSON, &inboundModel); err != nil {
-            jsonMsg(c, "Something went wrong!", err)
-            return
-        }
-
-        if restart, err := a.inboundService.UpdateInboundClient(&inboundModel, clientId); err != nil {
-            jsonMsg(c, "Something went wrong!", err)
-            return
-        } else {
-            needRestart = needRestart || restart
-        }
-    }
-
-    jsonMsg(c, "Client updated", nil)
-    if needRestart {
-        a.xrayService.SetToNeedRestart()
-    }
-}
-
-func (a *InboundController) resetClientTraffic(c *gin.Context) {
+// resetInboundTraffic resets traffic counters for a specific inbound.
+func (a *InboundController) resetInboundTraffic(c *gin.Context) {
 	id, err := strconv.Atoi(c.Param("id"))
 	if err != nil {
-		jsonMsg(c, I18nWeb(c, "pages.inbounds.update"), err)
+		jsonMsg(c, I18nWeb(c, "pages.inbounds.toasts.inboundUpdateSuccess"), err)
 		return
 	}
-	email := c.Param("email")
 
-	needRestart, err := a.inboundService.ResetClientTraffic(id, email)
+	err = a.inboundService.ResetInboundTraffic(id)
 	if err != nil {
-		jsonMsg(c, "Something went wrong!", err)
+		jsonMsg(c, I18nWeb(c, "somethingWentWrong"), err)
+		return
+	} else {
+		a.xrayService.SetToNeedRestart()
+	}
+	jsonMsg(c, I18nWeb(c, "pages.inbounds.toasts.resetInboundTrafficSuccess"), nil)
+}
+
+// delAllInboundClients removes every client attached to a specific inbound
+// while keeping the inbound itself. Internally collects the current email
+// list from settings.clients[] and feeds it into ClientService.BulkDelete,
+// which handles per-inbound JSON rewriting, runtime user removal, traffic
+// row cleanup, and the SyncInbound mapping pass in one optimized cycle.
+func (a *InboundController) delAllInboundClients(c *gin.Context) {
+	id, err := strconv.Atoi(c.Param("id"))
+	if err != nil {
+		jsonMsg(c, I18nWeb(c, "somethingWentWrong"), err)
 		return
 	}
-	jsonMsg(c, "Traffic has been reset", nil)
+	emails, err := a.inboundService.EmailsByInbound(id)
+	if err != nil {
+		jsonMsg(c, I18nWeb(c, "somethingWentWrong"), err)
+		return
+	}
+	if len(emails) == 0 {
+		jsonObj(c, service.BulkDeleteResult{}, nil)
+		return
+	}
+	result, needRestart, err := a.clientService.BulkDelete(&a.inboundService, emails, false)
+	if err != nil {
+		jsonMsg(c, I18nWeb(c, "somethingWentWrong"), err)
+		return
+	}
+	jsonObj(c, result, nil)
 	if needRestart {
 		a.xrayService.SetToNeedRestart()
 	}
+	user := session.GetLoginUser(c)
+	a.broadcastInboundsUpdate(user.Id)
+	notifyClientsChanged()
 }
 
-func (a *InboundController) resetGroupClientTraffic(c *gin.Context) {
-	var requestData []struct {
-		InboundID int    `json:"inboundId"` // Map JSON "inboundId" to struct field "InboundID"
-		Email     string `json:"email"`    // Map JSON "email" to struct field "Email"
-	}
-
-	// Parse JSON body directly using ShouldBindJSON
-	if err := c.ShouldBindJSON(&requestData); err != nil {
-		jsonMsg(c, "Invalid request data", err)
-		return
-	}
-
-	needRestart := false
-
-	// Process each request data
-	for _, req := range requestData {
-		needRestartTmp, err := a.inboundService.ResetClientTraffic(req.InboundID, req.Email)
-		if err != nil {
-			jsonMsg(c, "Failed to reset client traffic", err)
-			return
-		}
-
-		// If any request requires a restart, set needRestart to true
-		if needRestartTmp {
-			needRestart = true
-		}
-	}
-
-	// Send response back to the client
-	jsonMsg(c, "Traffic reset for all clients", nil)
-
-	// Restart the service if required
-	if needRestart {
-		a.xrayService.SetToNeedRestart()
-	}
-}
-
-
+// resetAllTraffics resets all traffic counters across all inbounds.
 func (a *InboundController) resetAllTraffics(c *gin.Context) {
 	err := a.inboundService.ResetAllTraffics()
 	if err != nil {
-		jsonMsg(c, "Something went wrong!", err)
+		jsonMsg(c, I18nWeb(c, "somethingWentWrong"), err)
 		return
 	} else {
 		a.xrayService.SetToNeedRestart()
 	}
-	jsonMsg(c, "all traffic has been reset", nil)
+	jsonMsg(c, I18nWeb(c, "pages.inbounds.toasts.resetAllTrafficSuccess"), nil)
 }
 
-func (a *InboundController) resetAllClientTraffics(c *gin.Context) {
-	id, err := strconv.Atoi(c.Param("id"))
-	if err != nil {
-		jsonMsg(c, I18nWeb(c, "pages.inbounds.update"), err)
-		return
-	}
-
-	err = a.inboundService.ResetAllClientTraffics(id)
-	if err != nil {
-		jsonMsg(c, "Something went wrong!", err)
-		return
-	} else {
-		a.xrayService.SetToNeedRestart()
-	}
-	jsonMsg(c, "All traffic from the client has been reset.", nil)
-}
-
+// importInbound imports an inbound configuration from provided data.
 func (a *InboundController) importInbound(c *gin.Context) {
 	inbound := &model.Inbound{}
 	err := json.Unmarshal([]byte(c.PostForm("data")), inbound)
 	if err != nil {
-		jsonMsg(c, "Something went wrong!", err)
+		jsonMsg(c, I18nWeb(c, "somethingWentWrong"), err)
 		return
 	}
 	user := session.GetLoginUser(c)
 	inbound.Id = 0
 	inbound.UserId = user.Id
-	if inbound.Listen == "" || inbound.Listen == "0.0.0.0" || inbound.Listen == "::" || inbound.Listen == "::0" {
-		inbound.Tag = fmt.Sprintf("inbound-%v", inbound.Port)
-	} else {
-		inbound.Tag = fmt.Sprintf("inbound-%v:%v", inbound.Listen, inbound.Port)
+	if inbound.NodeID != nil && *inbound.NodeID == 0 {
+		inbound.NodeID = nil
 	}
 
 	for index := range inbound.ClientStats {
@@ -454,28 +332,80 @@ func (a *InboundController) importInbound(c *gin.Context) {
 		inbound.ClientStats[index].Enable = true
 	}
 
-	needRestart := false
-	inbound, needRestart, err = a.inboundService.AddInbound(inbound)
-	jsonMsgObj(c, I18nWeb(c, "pages.inbounds.create"), inbound, err)
-	if err == nil && needRestart {
+	inbound, needRestart, err := a.inboundService.AddInbound(inbound)
+	if err != nil {
+		jsonMsg(c, I18nWeb(c, "somethingWentWrong"), err)
+		return
+	}
+	jsonMsgObj(c, I18nWeb(c, "pages.inbounds.toasts.inboundCreateSuccess"), inbound, nil)
+	if needRestart {
 		a.xrayService.SetToNeedRestart()
 	}
+	a.broadcastInboundsUpdate(user.Id)
+	notifyClientsChanged()
 }
 
-func (a *InboundController) delDepletedClients(c *gin.Context) {
+// resolveHost mirrors what sub.SubService.ResolveRequest does for the host
+// field: prefers X-Forwarded-Host (first entry of any list, port stripped),
+// then X-Real-IP, then the host portion of c.Request.Host. Keeping it in the
+// controller layer means the service interface stays HTTP-agnostic — service
+// methods receive a plain host string instead of a *gin.Context.
+func resolveHost(c *gin.Context) string {
+	if isTrustedForwardedRequest(c) {
+		if h := strings.TrimSpace(c.GetHeader("X-Forwarded-Host")); h != "" {
+			if i := strings.Index(h, ","); i >= 0 {
+				h = strings.TrimSpace(h[:i])
+			}
+			if hp, _, err := net.SplitHostPort(h); err == nil {
+				return hp
+			}
+			return h
+		}
+		if h := c.GetHeader("X-Real-IP"); h != "" {
+			return h
+		}
+	}
+	if h, _, err := net.SplitHostPort(c.Request.Host); err == nil {
+		return h
+	}
+	return c.Request.Host
+}
+
+// getFallbacks returns the fallback rules attached to the master inbound.
+func (a *InboundController) getFallbacks(c *gin.Context) {
 	id, err := strconv.Atoi(c.Param("id"))
 	if err != nil {
-		jsonMsg(c, I18nWeb(c, "pages.inbounds.update"), err)
+		jsonMsg(c, I18nWeb(c, "get"), err)
 		return
 	}
-	err = a.inboundService.DelDepletedClients(id)
+	rows, err := a.fallbackService.GetByMaster(id)
 	if err != nil {
-		jsonMsg(c, "Something went wrong!", err)
+		jsonMsg(c, I18nWeb(c, "get"), err)
 		return
 	}
-	jsonMsg(c, "All depleted clients are deleted", nil)
+	jsonObj(c, rows, nil)
 }
 
-func (a *InboundController) onlines(c *gin.Context) {
-	jsonObj(c, a.inboundService.GetOnlineClients(), nil)
+// setFallbacks atomically replaces the master inbound's fallback list
+// and triggers an Xray restart so the new settings.fallbacks take effect.
+func (a *InboundController) setFallbacks(c *gin.Context) {
+	id, err := strconv.Atoi(c.Param("id"))
+	if err != nil {
+		jsonMsg(c, I18nWeb(c, "somethingWentWrong"), err)
+		return
+	}
+	type body struct {
+		Fallbacks []service.FallbackInput `json:"fallbacks"`
+	}
+	var b body
+	if err := c.ShouldBindJSON(&b); err != nil {
+		jsonMsg(c, I18nWeb(c, "somethingWentWrong"), err)
+		return
+	}
+	if err := a.fallbackService.SetByMaster(id, b.Fallbacks); err != nil {
+		jsonMsg(c, I18nWeb(c, "somethingWentWrong"), err)
+		return
+	}
+	a.xrayService.SetToNeedRestart()
+	jsonMsg(c, I18nWeb(c, "pages.inbounds.toasts.inboundUpdateSuccess"), nil)
 }

@@ -1,15 +1,37 @@
+// Package logger provides logging functionality for the 3x-ui panel with
+// dual-backend logging (console/syslog and file) and buffered log storage for web UI.
 package logger
 
 import (
 	"fmt"
 	"os"
+	"path/filepath"
+	"runtime"
 	"time"
 
+	"github.com/mhsanaei/3x-ui/v3/config"
 	"github.com/op/go-logging"
+
+	"gopkg.in/natefinch/lumberjack.v2"
+)
+
+const (
+	maxLogBufferSize = 10240                 // Maximum log entries kept in memory
+	logFileName      = "3xui.log"            // Log file name
+	timeFormat       = "2006/01/02 15:04:05" // Log timestamp format
+
+	// On-disk rotation limits — single file capped, old segments pruned automatically.
+	maxLogFileMB    = 10 // rotate active log when larger than this
+	maxLogBackups   = 5  // rotated files retained (beyond current segment)
+	maxLogAgeDays   = 7  // remove rotated backups older than this (0 disables time-based pruning)
+	compressRotated = true
 )
 
 var (
-	logger    *logging.Logger
+	logger     *logging.Logger
+	fileRotate *lumberjack.Logger // nil when file backend disabled
+
+	// logBuffer maintains recent log entries in memory for web UI retrieval
 	logBuffer []struct {
 		time  string
 		level logging.Level
@@ -17,89 +39,161 @@ var (
 	}
 )
 
-func init() {
-	InitLogger(logging.INFO)
-}
-
+// InitLogger initializes dual logging backends: console/syslog and file.
+// Console logging uses the specified level, file logging always uses DEBUG level.
 func InitLogger(level logging.Level) {
 	newLogger := logging.MustGetLogger("x-ui")
-	var err error
-	var backend logging.Backend
-	var format logging.Formatter
-	ppid := os.Getppid()
+	backends := make([]logging.Backend, 0, 2)
 
-	backend, err = logging.NewSyslogBackend("")
-	if err != nil {
-		println(err)
-		backend = logging.NewLogBackend(os.Stderr, "", 0)
-	}
-	if ppid > 0 && err != nil {
-		format = logging.MustStringFormatter(`%{time:2006/01/02 15:04:05} %{level} - %{message}`)
-	} else {
-		format = logging.MustStringFormatter(`%{level} - %{message}`)
+	// Console/syslog backend with configurable level
+	if consoleBackend := initDefaultBackend(); consoleBackend != nil {
+		leveledBackend := logging.AddModuleLevel(consoleBackend)
+		leveledBackend.SetLevel(level, "x-ui")
+		backends = append(backends, leveledBackend)
 	}
 
-	backendFormatter := logging.NewBackendFormatter(backend, format)
-	backendLeveled := logging.AddModuleLevel(backendFormatter)
-	backendLeveled.SetLevel(level, "x-ui")
-	newLogger.SetBackend(backendLeveled)
+	// File backend with DEBUG level for comprehensive logging
+	if fileBackend := initFileBackend(); fileBackend != nil {
+		leveledBackend := logging.AddModuleLevel(fileBackend)
+		leveledBackend.SetLevel(logging.DEBUG, "x-ui")
+		backends = append(backends, leveledBackend)
+	}
 
+	multiBackend := logging.MultiLogger(backends...)
+	newLogger.SetBackend(multiBackend)
 	logger = newLogger
 }
 
-func Debug(args ...interface{}) {
+// initDefaultBackend creates the console/syslog logging backend.
+// Windows: Uses stderr directly (no syslog support)
+// Unix-like: Attempts syslog, falls back to stderr
+func initDefaultBackend() logging.Backend {
+	var backend logging.Backend
+	includeTime := false
+
+	if runtime.GOOS == "windows" {
+		// Windows: Use stderr directly (no syslog support)
+		backend = logging.NewLogBackend(os.Stderr, "", 0)
+		includeTime = true
+	} else {
+		// Unix-like: Try syslog, fallback to stderr
+		if syslogBackend, err := logging.NewSyslogBackend(""); err != nil {
+			fmt.Fprintf(os.Stderr, "syslog backend disabled: %v\n", err)
+			backend = logging.NewLogBackend(os.Stderr, "", 0)
+			includeTime = os.Getppid() > 0
+		} else {
+			backend = syslogBackend
+		}
+	}
+
+	return logging.NewBackendFormatter(backend, newFormatter(includeTime))
+}
+
+// initFileBackend creates the file logging backend with size/age‑bounded rotation
+// so log volume cannot grow without limit on disk.
+func initFileBackend() logging.Backend {
+	logDir := config.GetLogFolder()
+	if err := os.MkdirAll(logDir, 0o750); err != nil {
+		fmt.Fprintf(os.Stderr, "failed to create log folder %s: %v\n", logDir, err)
+		return nil
+	}
+
+	logPath := filepath.Join(logDir, logFileName)
+	fileRotate = &lumberjack.Logger{
+		Filename:   logPath,
+		MaxSize:    maxLogFileMB,
+		MaxBackups: maxLogBackups,
+		MaxAge:     maxLogAgeDays,
+		LocalTime:  true,
+		Compress:   compressRotated,
+	}
+
+	backend := logging.NewLogBackend(fileRotate, "", 0)
+	return logging.NewBackendFormatter(backend, newFormatter(true))
+}
+
+// newFormatter creates a log formatter with optional timestamp.
+func newFormatter(withTime bool) logging.Formatter {
+	format := `%{level} - %{message}`
+	if withTime {
+		format = `%{time:` + timeFormat + `} %{level} - %{message}`
+	}
+	return logging.MustStringFormatter(format)
+}
+
+// CloseLogger closes the rotating log writer and cleans up resources.
+// Should be called during application shutdown.
+func CloseLogger() {
+	if fileRotate != nil {
+		_ = fileRotate.Close()
+		fileRotate = nil
+	}
+}
+
+// Debug logs a debug message and adds it to the log buffer.
+func Debug(args ...any) {
 	logger.Debug(args...)
 	addToBuffer("DEBUG", fmt.Sprint(args...))
 }
 
-func Debugf(format string, args ...interface{}) {
+// Debugf logs a formatted debug message and adds it to the log buffer.
+func Debugf(format string, args ...any) {
 	logger.Debugf(format, args...)
 	addToBuffer("DEBUG", fmt.Sprintf(format, args...))
 }
 
-func Info(args ...interface{}) {
+// Info logs an info message and adds it to the log buffer.
+func Info(args ...any) {
 	logger.Info(args...)
 	addToBuffer("INFO", fmt.Sprint(args...))
 }
 
-func Infof(format string, args ...interface{}) {
+// Infof logs a formatted info message and adds it to the log buffer.
+func Infof(format string, args ...any) {
 	logger.Infof(format, args...)
 	addToBuffer("INFO", fmt.Sprintf(format, args...))
 }
 
-func Notice(args ...interface{}) {
+// Notice logs a notice message and adds it to the log buffer.
+func Notice(args ...any) {
 	logger.Notice(args...)
 	addToBuffer("NOTICE", fmt.Sprint(args...))
 }
 
-func Noticef(format string, args ...interface{}) {
+// Noticef logs a formatted notice message and adds it to the log buffer.
+func Noticef(format string, args ...any) {
 	logger.Noticef(format, args...)
 	addToBuffer("NOTICE", fmt.Sprintf(format, args...))
 }
 
-func Warning(args ...interface{}) {
+// Warning logs a warning message and adds it to the log buffer.
+func Warning(args ...any) {
 	logger.Warning(args...)
 	addToBuffer("WARNING", fmt.Sprint(args...))
 }
 
-func Warningf(format string, args ...interface{}) {
+// Warningf logs a formatted warning message and adds it to the log buffer.
+func Warningf(format string, args ...any) {
 	logger.Warningf(format, args...)
 	addToBuffer("WARNING", fmt.Sprintf(format, args...))
 }
 
-func Error(args ...interface{}) {
+// Error logs an error message and adds it to the log buffer.
+func Error(args ...any) {
 	logger.Error(args...)
 	addToBuffer("ERROR", fmt.Sprint(args...))
 }
 
-func Errorf(format string, args ...interface{}) {
+// Errorf logs a formatted error message and adds it to the log buffer.
+func Errorf(format string, args ...any) {
 	logger.Errorf(format, args...)
 	addToBuffer("ERROR", fmt.Sprintf(format, args...))
 }
 
+// addToBuffer adds a log entry to the in-memory ring buffer for web UI retrieval.
 func addToBuffer(level string, newLog string) {
 	t := time.Now()
-	if len(logBuffer) >= 10240 {
+	if len(logBuffer) >= maxLogBufferSize {
 		logBuffer = logBuffer[1:]
 	}
 
@@ -109,12 +203,13 @@ func addToBuffer(level string, newLog string) {
 		level logging.Level
 		log   string
 	}{
-		time:  t.Format("2006/01/02 15:04:05"),
+		time:  t.Format(timeFormat),
 		level: logLevel,
 		log:   newLog,
 	})
 }
 
+// GetLogs retrieves up to c log entries from the buffer that are at or below the specified level.
 func GetLogs(c int, level string) []string {
 	var output []string
 	logLevel, _ := logging.LogLevel(level)
